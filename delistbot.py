@@ -4,8 +4,10 @@ import logging
 import asyncio
 import json
 import math
-import aiohttp
 import platform
+import tempfile
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import List, Dict, Optional
@@ -22,6 +24,25 @@ logger = logging.getLogger(__name__)
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+# 不要なログをフィルタリング
+class MessageFilter(logging.Filter):
+    def filter(self, record):
+        filtered_messages = [
+            "Got difference",
+            "Connecting to",
+            "Connection complete",
+            "Disconnecting from",
+            "Disconnection complete",
+            "Phone migrated to",
+            "Reconnecting to new data center"
+        ]
+        return not any(msg in record.getMessage() for msg in filtered_messages)
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(MessageFilter())
+
+logging.getLogger('telethon').setLevel(logging.WARNING)
+
 @dataclass
 class DelistEvent:
     """デリストイベントの情報を格納"""
@@ -29,151 +50,23 @@ class DelistEvent:
     event_detected_time: datetime
     event_text: str
 
-class TelegramChannelMonitor:
-    """TelegramチャンネルからBinanceデリスト通知を監視（WebhookまたはLong Polling方式）"""
-    
-    def __init__(self, bot_token: str, channel_username: str):
-        self.bot_token = bot_token
-        self.channel_username = channel_username
-        self.api_url = f"https://api.telegram.org/bot{bot_token}"
-        self.offset = 0
-        self.is_running = False
-        self.last_processed_message_id = 0
-        
-    async def start(self):
-        """監視を開始"""
-        try:
-            self.is_running = True
-            logger.info(f"Started monitoring channel: {self.channel_username}")
-            
-            # Long Pollingループを開始
-            while self.is_running:
-                try:
-                    # チャンネルからの更新を取得
-                    updates = await self.get_updates()
-                    
-                    for update in updates:
-                        # チャンネルポストかMessageクラスかを確認
-                        if "channel_post" in update:
-                            message = update["channel_post"]
-                        elif "message" in update:
-                            message = update["message"]
-                        else:
-                            continue
-                        
-                        # チャンネルからのメッセージか確認
-                        if message.get("chat", {}).get("username") == self.channel_username.replace("@", ""):
-                            message_text = message.get("text", "")
-                            message_id = message.get("message_id", 0)
-                            
-                            # 重複処理を防止
-                            if message_id <= self.last_processed_message_id:
-                                continue
-                            
-                            self.last_processed_message_id = message_id
-                            logger.info(f"[TELEGRAM] New message: {message_text}")
-                            
-                            # デリストメッセージを検出
-                            delist_event = self.parse_delist_message(message_text)
-                            if delist_event:
-                                logger.info(f"[DELIST] Detected: {delist_event}")
-                                await self.on_delist_detected(delist_event)
-                    
-                    # 短い待機時間を設定
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    logger.error(f"[ERROR] Error in monitoring loop: {e}")
-                    await asyncio.sleep(5)
-                
-        except Exception as e:
-            logger.error(f"[ERROR] Error starting Telegram monitor: {e}")
-            self.is_running = False
-    
-    async def get_updates(self):
-        """Telegram Bot APIからアップデートを取得"""
-        try:
-            # aiohttpのセッションタイムアウト設定を追加（Windowsの問題を回避）
-            timeout = aiohttp.ClientTimeout(total=60, connect=30)
-            connector = aiohttp.TCPConnector(enable_cleanup_closed=True)
-            
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                params = {
-                    "offset": self.offset,
-                    "timeout": 30,
-                    "allowed_updates": ["channel_post", "message"]
-                }
-                async with session.get(f"{self.api_url}/getUpdates", params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("ok"):
-                            updates = data.get("result", [])
-                            if updates:
-                                # オフセットを更新
-                                self.offset = updates[-1]["update_id"] + 1
-                            return updates
-                        else:
-                            logger.error(f"API Error: {data}")
-                    else:
-                        logger.error(f"HTTP Error: {response.status}")
-                    return []
-        except Exception as e:
-            logger.error(f"[ERROR] Error getting updates: {e}")
-            return []
-    
-    def parse_delist_message(self, text: str) -> Optional[DelistEvent]:
-        """デリストメッセージのパース"""
-        try:
-            # パターン例: "Binance EN: Binance Will Delist CVP, EPX, FOR, LOOM, REEF, VGX on 2024-08-19"
-            # または "Binance Will Delist xxx on yyyy-mm-dd"
-            delist_patterns = [
-                r"Binance(?:\s+EN)?:?\s*Binance\s+Will\s+Delist\s+(.*?)\s+on\s+",
-                r"Binance\s+Will\s+Delist\s+(.*?)(?:\s+on\s+|$)"
-            ]
-            
-            for pattern in delist_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    token_str = match.group(1)
-                    
-                    # 複数トークンを処理
-                    tokens = []
-                    # カンマまたは"and"で区切られたトークンを分割
-                    token_parts = re.split(r',\s*|and', token_str)
-                    for token in token_parts:
-                        # トークンシンボルを抽出（英字と数字のみ）
-                        symbol_match = re.search(r'([A-Z0-9]+)', token.strip(), re.IGNORECASE)
-                        if symbol_match:
-                            base_token = symbol_match.group(1).upper()
-                            tokens.append(base_token)
-                    
-                    if tokens:
-                        return DelistEvent(
-                            tokens=tokens,
-                            event_detected_time=datetime.now(),
-                            event_text=text
-                        )
-                        
-            return None
-            
-        except Exception as e:
-            logger.error(f"[ERROR] Error parsing delist message: {e}")
-            return None
-    
-    async def on_delist_detected(self, event: DelistEvent):
-        """デリストイベント検出時のコールバック"""
-        # サブクラスでオーバーライド
-        pass
-    
-    async def stop(self):
-        """監視を停止"""
-        self.is_running = False
-
-class DelistTradingBot(TelegramChannelMonitor):
+class DelistTradingBot:
     """Binanceデリストイベントを基にした自動取引ボット"""
     
-    def __init__(self, bot_token: str, channel_username: str):
-        super().__init__(bot_token, channel_username)
+    def __init__(self):
+        # 環境変数の読み込み
+        load_dotenv()
+        
+        # Telegram API設定
+        self.api_id = os.getenv("TELEGRAM_API_ID")
+        self.api_hash = os.getenv("TELEGRAM_API_HASH")
+        self.phone = os.getenv("TELEGRAM_PHONE")
+        self.channel_username = "BWEnews_JP"  # https://t.me/BWEnews_JP
+        
+        if not self.api_id or not self.api_hash:
+            raise ValueError("TELEGRAM_API_ID or TELEGRAM_API_HASH not set in environment variables")
+        
+        # Bybit関連の設定
         self.bybit_client = BybitClient()
         self.notifier = TelegramNotifier()
         self.leverage = 5
@@ -188,10 +81,11 @@ class DelistTradingBot(TelegramChannelMonitor):
         self.symbol_update_interval = 3600  # 1時間ごとに更新
         self.last_symbol_update_time = None
         
-        # 銘柄リスト更新タスク
-        self._symbol_update_task = None
+        # Telegramセッション関連
+        self.client = None
+        self.session_file = None
         
-        # 起動時の初期化
+        # 初期化処理を非同期で開始
         asyncio.create_task(self.initialize_symbol_cache())
     
     async def initialize_symbol_cache(self):
@@ -202,18 +96,15 @@ class DelistTradingBot(TelegramChannelMonitor):
             logger.info(f"[DELIST] Symbol cache initialized. Total mappings: {len(self.token_symbol_mapping)}")
             
             # 定期的な更新を開始
-            self._symbol_update_task = asyncio.create_task(self.periodic_symbol_update())
+            asyncio.create_task(self.periodic_symbol_update())
         except Exception as e:
             logger.error(f"[ERROR] Failed to initialize symbol cache: {e}")
     
     async def periodic_symbol_update(self):
         """定期的にBybit銘柄リストを更新"""
         try:
-            while self.is_running:
+            while True:
                 await asyncio.sleep(self.symbol_update_interval)
-                if not self.is_running:
-                    break
-                
                 logger.info("[DELIST] Updating symbol cache...")
                 await self.update_symbol_cache()
                 logger.info(f"[DELIST] Symbol cache updated. Total mappings: {len(self.token_symbol_mapping)}")
@@ -260,6 +151,45 @@ class DelistTradingBot(TelegramChannelMonitor):
             
         except Exception as e:
             logger.error(f"[ERROR] Error updating symbol cache: {e}")
+    
+    def parse_delist_message(self, text: str) -> Optional[DelistEvent]:
+        """デリストメッセージのパース"""
+        try:
+            # パターン例: "Binance EN: Binance Will Delist CVP, EPX, FOR, LOOM, REEF, VGX on 2024-08-19"
+            # または "Binance Will Delist xxx on yyyy-mm-dd"
+            delist_patterns = [
+                r"Binance(?:\s+EN)?:?\s*Binance\s+Will\s+Delist\s+(.*?)\s+on\s+",
+                r"Binance\s+Will\s+Delist\s+(.*?)(?:\s+on\s+|$)"
+            ]
+            
+            for pattern in delist_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    token_str = match.group(1)
+                    
+                    # 複数トークンを処理
+                    tokens = []
+                    # カンマまたは"and"で区切られたトークンを分割
+                    token_parts = re.split(r',\s*|and', token_str)
+                    for token in token_parts:
+                        # トークンシンボルを抽出（英字と数字のみ）
+                        symbol_match = re.search(r'([A-Z0-9]+)', token.strip(), re.IGNORECASE)
+                        if symbol_match:
+                            base_token = symbol_match.group(1).upper()
+                            tokens.append(base_token)
+                    
+                    if tokens:
+                        return DelistEvent(
+                            tokens=tokens,
+                            event_detected_time=datetime.now(),
+                            event_text=text
+                        )
+                        
+            return None
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Error parsing delist message: {e}")
+            return None
     
     def find_trading_pairs(self, tokens: List[str]) -> List[str]:
         """キャッシュされた銘柄リストからトークンに対応する取引ペアを高速検索"""
@@ -460,18 +390,117 @@ class DelistTradingBot(TelegramChannelMonitor):
         
         return message
     
-    async def stop(self):
-        """監視を停止"""
-        self.is_running = False
-        if hasattr(self, '_symbol_update_task') and self._symbol_update_task:
-            self._symbol_update_task.cancel()
-        await super().stop()
+    async def handle_authentication(self):
+        """認証処理"""
+        try:
+            logger.info("Starting authentication process...")
+            await self.client.send_code_request(self.phone)
+            code = input('Please enter the verification code you received: ')
+            logger.info("Attempting to sign in with the provided code...")
+            
+            try:
+                await self.client.sign_in(self.phone, code)
+            except SessionPasswordNeededError:
+                logger.info("Two-factor authentication required")
+                password = input('Please enter your 2FA password: ')
+                await self.client.sign_in(password=password)
+            
+            logger.info("Authentication successful!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Authentication failed: {e}")
+            return False
+    
+    async def initialize_client(self):
+        """Telegramクライアントの初期化"""
+        try:
+            logger.info("Initializing Telegram client...")
+            
+            # 電話番号の確認と設定
+            if not self.phone:
+                self.phone = input("Please enter your phone number (with country code, e.g., +819012345678): ")
+                if not self.phone.startswith('+'):
+                    if self.phone.startswith('0'):
+                        self.phone = '+81' + self.phone[1:]
+                    else:
+                        self.phone = '+' + self.phone
+            
+            # セッションファイルの作成
+            temp_dir = tempfile.gettempdir()
+            self.session_file = os.path.join(temp_dir, f'delist_bot_session_{os.getpid()}')
+            
+            # クライアントの初期化
+            self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
+            await self.client.connect()
+            
+            # 認証チェック
+            if not await self.client.is_user_authorized():
+                if not await self.handle_authentication():
+                    raise Exception("Authentication failed")
+            
+            logger.info("Telegram client initialized successfully")
+            
+        except Exception as e:
+            self.cleanup_session()
+            logger.error(f"Failed to initialize Telegram client: {e}")
+            raise
+    
+    async def setup_message_handler(self):
+        """メッセージハンドラーの設定"""
+        @self.client.on(events.NewMessage(incoming=True))
+        async def message_handler(event):
+            try:
+                # チャンネルメッセージのみを処理
+                if not hasattr(event.chat, 'username') or event.chat.username != self.channel_username:
+                    return
+                
+                message_text = event.text
+                logger.info(f"[TELEGRAM] New message from {self.channel_username}: {message_text}")
+                
+                # デリストメッセージを検出
+                delist_event = self.parse_delist_message(message_text)
+                if delist_event:
+                    logger.info(f"[DELIST] Detected: {delist_event}")
+                    await self.on_delist_detected(delist_event)
+                    
+            except Exception as e:
+                logger.error(f"[ERROR] Error processing message: {e}")
+    
+    def cleanup_session(self):
+        """セッションのクリーンアップ"""
+        try:
+            if self.session_file and os.path.exists(self.session_file):
+                os.remove(self.session_file)
+                logger.info(f"Cleaned up session file: {self.session_file}")
+        except Exception as e:
+            logger.error(f"Error cleaning up session: {e}")
+    
+    async def run(self):
+        """メインループ"""
+        try:
+            # クライアントの初期化
+            await self.initialize_client()
+            
+            # メッセージハンドラーの設定
+            await self.setup_message_handler()
+            
+            logger.info(f"Started monitoring channel: {self.channel_username}")
+            print(f"\nMonitoring started for channel: {self.channel_username}")
+            print("Waiting for delist messages...")
+            
+            # クライアントを実行
+            await self.client.run_until_disconnected()
+            
+        except Exception as e:
+            logger.error(f"Monitor crashed: {e}")
+        finally:
+            if self.client:
+                await self.client.disconnect()
+            self.cleanup_session()
 
 async def main():
     """メインエントリーポイント"""
-    # 環境変数のロード
-    load_dotenv()
-    
     # ロギング設定
     logging.basicConfig(
         level=logging.INFO,
@@ -479,26 +508,14 @@ async def main():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Telegram設定
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    channel_username = "BWEnews_JP"  # https://t.me/BWEnews_JP
-    
-    if not bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN not set in environment variables")
-        return
-    
-    # ボットを初期化して実行
-    bot = DelistTradingBot(bot_token, channel_username)
-    
     try:
-        logger.info("Starting Binance Delisting Trading Bot...")
-        await bot.start()
+        bot = DelistTradingBot()
+        await bot.run()
     except KeyboardInterrupt:
-        logger.info("Stopping bot...")
-        await bot.stop()
+        logger.info("Monitoring stopped by user")
+        print("\nMonitoring stopped by user. Goodbye!")
     except Exception as e:
-        logger.error(f"Error running bot: {e}")
-        await bot.stop()
+        logger.error(f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
