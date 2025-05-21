@@ -61,7 +61,7 @@ class DelistTradingBot:
         self.api_id = os.getenv("TELEGRAM_API_ID")
         self.api_hash = os.getenv("TELEGRAM_API_HASH")
         self.phone = os.getenv("TELEGRAM_PHONE")
-        self.channel_username = "BWEnews_JP"  # https://t.me/BWEnews_JP
+        self.channel_username = os.getenv("TELEGRAM_CHANNEL_USERNAME", "BWEnews_JP")  # https://t.me/BWEnews_JP
         
         if not self.api_id or not self.api_hash:
             raise ValueError("TELEGRAM_API_ID or TELEGRAM_API_HASH not set in environment variables")
@@ -69,16 +69,29 @@ class DelistTradingBot:
         # Bybit関連の設定
         self.bybit_client = BybitClient()
         self.notifier = TelegramNotifier()
-        self.leverage = 5
-        self.position_percent = 1.0  # 資産の100%
-        self.funding_threshold = -0.01  # -1%以下
+        
+        # 環境変数からパラメータを読み込み（デフォルト値付き）
+        self.leverage = float(os.getenv("LEVERAGE", "5"))
+        self.position_percent = float(os.getenv("POSITION_PERCENT", "1.0"))
+        self.funding_threshold = float(os.getenv("FUNDING_THRESHOLD", "-0.01"))
+        self.cooldown_hours = float(os.getenv("COOLDOWN_HOURS", "24"))
+        self.max_trades_per_event = int(os.getenv("MAX_TRADES_PER_EVENT", "1"))
+        
+        # 設定値をログに記録
+        logger.info(f"[CONFIG] Loaded parameters from environment:")
+        logger.info(f"[CONFIG] Leverage: {self.leverage}x")
+        logger.info(f"[CONFIG] Position Percent: {self.position_percent * 100}%")
+        logger.info(f"[CONFIG] Funding Threshold: {self.funding_threshold:.4%}")
+        logger.info(f"[CONFIG] Cooldown Hours: {self.cooldown_hours}h")
+        logger.info(f"[CONFIG] Max Trades Per Event: {self.max_trades_per_event}")
+        logger.info(f"[CONFIG] Telegram Channel: {self.channel_username}")
+        logger.info(f"[CONFIG] Symbol Update Interval: {self.symbol_update_interval}s")
+        
         self.traded_events = set()  # 重複取引防止
-        self.cooldown_hours = 24 # クールダウン期間
-        self.max_trades_per_event = 1  # イベントごとの最大取引数
         
         # 銘柄マッピングリスト（キャッシュ）
         self.token_symbol_mapping = {}  # {トークン名: [可能なBybitシンボル]}
-        self.symbol_update_interval = 3600  # 1時間ごとに更新
+        self.symbol_update_interval = int(os.getenv("SYMBOL_UPDATE_INTERVAL", "3600"))  # デフォルト1時間ごとに更新
         self.last_symbol_update_time = None
         
         # Telegramセッション関連
@@ -304,7 +317,7 @@ class DelistTradingBot:
                     "symbol": symbol
                 }
             
-            # 証拠金計算（残高の100%使用）
+            # 証拠金計算（残高の設定%使用）
             margin = balance * self.position_percent
             
             # レバレッジ設定
